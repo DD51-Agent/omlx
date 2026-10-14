@@ -51,6 +51,7 @@ from mlx_lm.models.switch_layers import (
 )
 
 from ..scheduler import _sync_and_clear_cache
+from .moe_expert_lookahead import ExpertLookaheadPredictor
 
 logger = logging.getLogger(__name__)
 
@@ -409,6 +410,21 @@ class ExpertCache:
         self.free = list(range(capacity))
         self.map = mx.full((self.n_experts,), -1, dtype=mx.int32)
         self.warm = False
+        # Count of prefetch reads still in flight.
+        self._pf_in_flight = 0
+
+    def release_slots(self) -> int:
+        """Shrink to ``floor`` empty slots; return the slot bytes given up."""
+        if self.capacity <= self.floor:
+            return 0
+        freed = (self.capacity - self.floor) * self.expert_bytes
+        self._allocate(self.floor)
+        return freed
+
+    def restore_slots(self) -> None:
+        """Return to the full capacity after :meth:`release_slots`."""
+        if self.capacity < self.full_capacity:
+            self._allocate(self.full_capacity)
 
     def release_slots(self) -> int:
         """Shrink to ``floor`` empty slots; return the slot bytes given up."""
@@ -452,7 +468,10 @@ class ExpertCache:
                 scores[slot] = np.inf
         slot = int(np.argmin(scores))
         old_e = int(self.slot_expert[slot])
-        del self.slot_of[old_e]
+        # A batch-reserved slot can be freed (slot_expert == -1) before its
+        # slot_of entry is popped, so guard against KeyError on `del`.
+        if old_e != -1:
+            self.slot_of.pop(old_e, None)
         self.slot_expert[slot] = -1
         self.map[old_e] = -1
         return slot
@@ -461,6 +480,41 @@ class ExpertCache:
         """Copy one expert's fetched bytes into ``slot``."""
         for name, field, plan, raw in payload:
             self.resident[name][field][slot] = CheckpointExpertStore.to_mx(plan, raw)
+
+    def _reserve_many(self, n: int, protected=frozenset()) -> list:
+        """Claim up to ``n`` slots; each goes through :meth:`_reserve` so the
+        slot bookkeeping stays consistent after every step.
+        """
+        slots: list[int] = []
+        for _ in range(n):
+            slots.append(self._reserve(protected))
+        return slots
+
+    def _write_many(self, pairs: list) -> None:
+        """Install many experts in one call.
+
+        ``pairs`` is ``[(expert_id, payload), ...]``. Raises on partial write
+        and rolls back the free list, mirroring the single-expert contract.
+        """
+        if not pairs:
+            return
+        slots = self._reserve_many(len(pairs))
+        written: list[int] = []
+        try:
+            for slot, (e, payload) in zip(slots, pairs):
+                for name, field, plan, raw in payload:
+                    self.resident[name][field][slot] = CheckpointExpertStore.to_mx(plan, raw)
+                written.append(slot)
+        except BaseException:
+            for slot in written:
+                self.free.append(slot)
+            raise
+        for slot, (e, _payload) in zip(slots, pairs):
+            self.slot_of[e] = slot
+            self.slot_expert[slot] = e
+            self.map[e] = slot
+            self.fetched_bytes += self.expert_bytes
+        self.warm = len(self.slot_of) == self.n_experts
 
     def _install(
         self, e: int, payload: list | None = None, protected=frozenset()
@@ -506,7 +560,16 @@ class ExpertCache:
                 break
             if e not in self.slot_of:
                 out[e] = self._submit(pool, e)
+                self._pf_in_flight += 1
         return out
+
+    def prefetch_in_flight(self) -> int:
+        """Count of ``_read_ahead``-submitted reads not yet consumed by
+        ``_ensure_ids``. The predictor uses this to drop its own submission
+        when the IO pool is already busy (a non-zero value means queueing
+        more would only delay later layers' critical-path reads).
+        """
+        return self._pf_in_flight
 
     def _ensure_ids(self, ids, on_slow_read=None, pending=None) -> bool:
         """:meth:`ensure` for routes already read back from the device.
@@ -554,6 +617,9 @@ class ExpertCache:
         try:
             prefetch(window)
             deadline = time.perf_counter() + _OVERLAP_GRACE_S
+            # Collect the per-miss installs, then flush them in one call
+            # instead of one ``_install`` per miss.
+            pending_pairs: list[tuple[int, list]] = []
             for done, e in enumerate(misses):
                 self.misses += 1
                 # Count the current payload in the window until its writes finish.
@@ -568,19 +634,23 @@ class ExpertCache:
                         keepalive = _gpu_keepalive()
                     on_slow_read = None
                 if group is None:
-                    self._install(e, protected=protected)
+                    pending_pairs.append((e, None))
                     continue
                 if keepalive is not None:
                     keepalive.wait([f for _, _, _, f in group])
                 if barrier is not None:
                     mx.eval(barrier)  # right before the first slot write
                     barrier = None
-                self._install(
-                    e,
-                    [(name, field, plan, f.result()) for name, field, plan, f in group],
-                    protected,
+                pending_pairs.append(
+                    (e, [(name, field, plan, f.result()) for name, field, plan, f in group])
                 )
                 del pending[e], group
+                self._pf_in_flight -= 1
+            if pending_pairs:
+                self._write_many(
+                    [(e, p or [(n, fld, pl, CheckpointExpertStore.read(pl)) for n, fld, pl in self._plans(e)])
+                     for e, p in pending_pairs]
+                )
         finally:
             _drain(pending)
         # No mx.eval here: installs are already-materialized host arrays, and
@@ -655,7 +725,15 @@ class OffloadSwitchGLU(nn.Module):
     """SwitchGLU whose experts live in an :class:`ExpertCache`."""
 
     def __init__(
-        self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView, floor: int = 1
+        self,
+        glu: SwitchGLU,
+        capacity: int,
+        disk: _GLUStoreView,
+        floor: int = 1,
+        *,
+        layer_idx: int = -1,
+        router_gate: "mx.array | None" = None,
+        predictor: "ExpertLookaheadPredictor | None" = None,
     ):
         super().__init__()
         self.cache = ExpertCache(glu, capacity, disk, floor)
@@ -663,6 +741,11 @@ class OffloadSwitchGLU(nn.Module):
         # Fetch/compute overlap in decode: the GPU stays busy while slow
         # reads of missing experts are pending.
         self._overlap = True
+        # Lookahead expert prefetch (LES-style): register this layer's
+        # router gate with the shared predictor when enabled.
+        self._layer_idx = layer_idx
+        self._predictor = predictor
+        self._router_gate = router_gate
 
     def _glu(self, x: mx.array, slots: mx.array) -> mx.array:
         c = self.cache
@@ -853,7 +936,24 @@ class OffloadSwitchGLU(nn.Module):
         if k > c.capacity:
             raise ValueError("Expert cache capacity is smaller than routing top-k")
         if n_tok * k <= c.capacity or n_tok == 1:
-            return self._forward(x, indices)
+            out = self._forward(x, indices)
+            # Lookahead prefetch: predict the next MoE layer's experts from
+            # this layer's output hidden, and arm the offload cache's IO
+            # pool so the next layer's miss reads overlap this layer's GPU
+            # compute. Decode-only (n_tok == 1); no-op otherwise.
+            if n_tok == 1 and self._predictor is not None and self._layer_idx >= 0:
+                # Record this layer's actual top-k routes so the predictor can
+                # score prediction accuracy against the ground truth for the
+                # layer being predicted.
+                c.last_actual_routes = dict(getattr(c, "last_actual_routes", {}))
+                c.last_actual_routes[self._layer_idx] = set(int(v) for v in flat_i.reshape(-1).tolist())
+                try:
+                    self._predictor.arm_from_hidden(c, self._layer_idx, x)
+                except Exception:
+                    # Lookahead is an optimization, not part of the numeric
+                    # path: a failure must never abort the layer's forward.
+                    pass
+            return out
         ids = flat_i.reshape(-1).tolist()
         if len(set(ids)) <= c.capacity:
             return self._forward(x, indices)
@@ -861,6 +961,20 @@ class OffloadSwitchGLU(nn.Module):
         # Mirror the stock SwitchGLU's sort rule for the call as a whole, so
         # every chunk runs the kernel the resident model would have used.
         out = self._forward_expert_major(flat_x, ids, k, indices.size >= 64)
+        # Prefill-end prefetch: the last token's row of ``x`` is exactly
+        # the hidden state that decode step 1 will feed into this same layer,
+        # so arm a single-step prediction NOW (span=1, not the predictor's
+        # multi-step span: post-prefill only the immediate next layer matters,
+        # later layers will each arm their own prediction on their own
+        # decode steps). This uses the idle IO pool window right after
+        # prefill's expert-major churn finishes, filling decode step 1's
+        # warm-up gap instead of waiting for it to cold-miss.
+        if self._predictor is not None and self._layer_idx >= 0 and n_tok > 1:
+            try:
+                self._predictor.arm_prefill_warmup(c, self._layer_idx, flat_x[-1])
+            except Exception:
+                # Lookahead is an optimization, not part of the numeric path.
+                pass
         return out.reshape(indices.shape + (x.shape[-1],))
 
 
@@ -1029,6 +1143,73 @@ def _resolve_store_view(
     return view, None
 
 
+def _settings_key_for(model_dir: Path) -> str:
+    """Settings-file key for a checkpoint directory.
+
+    Local models are keyed by directory name: ``DiscoveredModel.model_id`` is
+    ``model_dir.name`` and ``model_path`` is ``str(model_dir)``. HF Hub cache
+    entries live under ``models--Org--repo/snapshots/<hash>/`` but are keyed
+    by the route-safe repo id, so the ``models--`` segment wins with its
+    prefix stripped (``_decode_hf_cache_model_id``).
+    """
+    for part in Path(model_dir).parts:
+        if part.startswith("models--"):
+            return part[len("models--"):]
+    return Path(model_dir).name
+
+
+def _lookup_settings(model_dir: Path):
+    """Per-model settings for this checkpoint, or ``None`` if unreachable.
+
+    Called once at wrap time; the object is only read for the four lookahead
+    fields and never stored. Best effort -- a missing server or manager just
+    leaves the prefetch off. Lazy import: ``omlx.server`` does not import this
+    patch at module level, so there is no cycle.
+    """
+    try:
+        from omlx.server import _server_state
+    except Exception:
+        return None
+    manager = getattr(_server_state, "settings_manager", None)
+    if manager is None:
+        return None
+    key = _settings_key_for(model_dir)
+    if not manager.has_settings(key):
+        logger.info(
+            "moe expert offload: no settings entry for %r, lookahead off", key
+        )
+    return manager.get_settings(key)
+
+
+def _resolve_lookahead(model_dir) -> tuple:
+    """Resolve the lookahead prefetch shape from the model's own settings.
+
+    Reads the four ``moe_expert_lookahead_prefetch_*`` fields off the
+    per-model settings so each model can tune the prefetch shape on its own;
+    an unreachable settings source falls back to the off defaults so behaviour
+    is unchanged there.
+
+    ``depth`` is the number of predicted experts and should match the model's
+    ``num_experts_per_tok``: predicting more never gets read and only evicts
+    useful slots, predicting fewer leaves prefetchable rounds unhidden.
+    ``read_n`` is how many of those predictions actually trigger SSD reads
+    (``-1`` = all of them). ``span`` is how many following MoE layers to
+    predict ahead from a single arm (1 = single-step, the legacy shape).
+    """
+    settings = _lookup_settings(model_dir)
+    if settings is None:
+        return False, 0, 0, 1
+    depth = int(getattr(settings, "moe_expert_lookahead_prefetch_depth", 8))
+    read_n = int(getattr(settings, "moe_expert_lookahead_prefetch_read", -1))
+    span = int(getattr(settings, "moe_expert_lookahead_prefetch_span", 8))
+    return (
+        bool(getattr(settings, "moe_expert_lookahead_prefetch_enabled", False)),
+        depth,
+        read_n,
+        span,
+    )
+
+
 def apply_moe_expert_offload(
     model,
     model_path: str | Path,
@@ -1077,6 +1258,11 @@ def apply_moe_expert_offload(
         model, model_dir, resident_fraction, mtp_resident=mtp_resident
     )
     total_bytes = resident_bytes = 0
+    _la_enabled, _la_depth, _la_read_n, _la_span = _resolve_lookahead(model_dir)
+    if _la_enabled and _la_read_n <= 0:
+        _la_read_n = _la_depth
+    _la_layer_idx = 0
+    _offloaded_glus: list = []  # 记录 (OffloadSwitchGLU, router_gate) 供 wrap 后回填 predictor
     for parent, key, glu, path in list(_iter_switch_glus(model)):
         if mtp_resident and _is_mtp_path(path):
             # Lightning MTP drafts from this head every step; streaming its
@@ -1104,17 +1290,71 @@ def apply_moe_expert_offload(
         )
         total_bytes += layer_bytes
         resident_bytes += layer_bytes * capacity // n_experts
-        new = OffloadSwitchGLU(glu, capacity, view, minimum)
+        # Fetch the router gate weight from the model tree: for Qwen3/RAZOR
+        # it is the parent SparseMoeBlock's .gate (nn.Linear dim->E, weight
+        # [E, dim]); for other families it may not exist -> skip gracefully.
+        _router_gate = None
+        if isinstance(parent, nn.Module):
+            _gate_mod = getattr(parent, "gate", None)
+            if _gate_mod is not None and hasattr(_gate_mod, "weight"):
+                _router_gate = _gate_mod.weight
+        new = OffloadSwitchGLU(
+            glu,
+            capacity,
+            view,
+            minimum,
+            layer_idx=_la_layer_idx,
+            router_gate=_router_gate,
+            predictor=None,  # 占位；wrap 完成后根据 invariant 统一回填
+        )
         if isinstance(parent, nn.Module):
             setattr(parent, key, new)  # registers via Module.__setattr__
         else:
             parent[key] = new  # plain list / plain dict
         wrapped += 1
+        _la_layer_idx += 1
+        _offloaded_glus.append((new, _router_gate, _la_layer_idx - 1))
         # Dropped source buffers land in the MLX pool, which the server pins
         # to total RAM, so drain per layer to bound the load transient
         # (same reasoning as the gate/up fusion patch, #2304).
         _sync_and_clear_cache()
 
+    # Lookahead expert prefetch — INVARIANT: predictor only activates when
+    # expert offload is actually engaged (wrapped > 0). Without offload there
+    # is no reactive SSD read to hide, so prefetch would be inert at best,
+    # or worse, a pure correctness hazard.
+    if wrapped == 0:
+        if _la_enabled:
+            logger.info(
+                "moe expert offload: lookahead disabled (offload not engaged, 0 layers wrapped)"
+            )
+        _sync_and_clear_cache()
+        return wrapped
+    if not _la_enabled or _la_depth <= 0:
+        logger.info(
+            "moe expert offload: lookahead prefetch off (offload engaged, %d layers wrapped)",
+            wrapped,
+        )
+        _sync_and_clear_cache()
+        return wrapped
+    logger.info(
+        "moe expert offload: lookahead resolved enabled=%s depth=%d read_n=%d span=%d",
+        _la_enabled, _la_depth, _la_read_n, _la_span,
+    )
+    _predictor = ExpertLookaheadPredictor(
+        gate_w_for=None,
+        depth=_la_depth,
+        read_n=_la_read_n,
+        span=_la_span,
+    )
+    for glu_obj, gate, idx in _offloaded_glus:
+        if gate is not None:
+            _predictor.register(idx, gate)
+            glu_obj._predictor = _predictor
+    logger.info(
+        "moe expert offload: lookahead prefetch enabled depth=%d read_n=%d span=%d (offload engaged, %d layers wrapped)",
+        _la_depth, _la_read_n, _la_span, wrapped,
+    )
     if total_bytes:
         logger.info(
             "moe expert offload: wrapped %d layers at %.1f%% residency "
@@ -1302,13 +1542,59 @@ def moe_offload_stats(model=None, caches=None) -> dict:
     hits = sum(c.hits for c in caches)
     misses = sum(c.misses for c in caches)
     total = hits + misses
-    return {
+    out = {
         "layers": len(caches),
         "hits": hits,
         "misses": misses,
         "hit_rate": (hits / total) if total else None,
         "fetched_bytes": sum(getattr(c, "fetched_bytes", 0) for c in caches),
     }
+    # Prediction effectiveness (被预测专家的实际有效率)：从 predictor 汇总
+    # 预测器挂在每个 OffloadSwitchGLU._predictor 上；caches 是 ExpertCache，
+    # 通过 cache.glu 回查到 predictor（ExpertCache.__init__ 收到 glu 但未存引用）
+    pred_count = pred_hits = 0
+    n_pred_layers = 0
+    pred_by_layer = {}
+    glu_by_cache = {}
+    # 用 walk model 收集 (glu, cache) 对
+    def _collect_glu_cache(model):
+        out = []
+        stack = [model]
+        seen = set()
+        while stack:
+            obj = stack.pop()
+            if id(obj) in seen:
+                continue
+            seen.add(id(obj))
+            cache = getattr(obj, "cache", None)
+            if getattr(cache, "moe_offload_cache", False):
+                pred = getattr(obj, "_predictor", None)
+                if pred is not None:
+                    out.append((obj, cache, pred))
+                if isinstance(obj, dict):
+                    stack.extend(obj.values())
+                elif isinstance(obj, (list, tuple)):
+                    stack.extend(obj)
+        return out
+    for glu_obj, cache, pred in _collect_glu_cache(model):
+        st = pred.stats
+        if not isinstance(st, dict):
+            st = st()
+        pc = st.get("pred_count", 0)
+        ph = st.get("pred_hits", 0)
+        pred_count += pc
+        pred_hits += ph
+        if pc:
+            n_pred_layers += 1
+            idx = getattr(cache, "layer_idx", getattr(glu_obj, "_layer_idx", "?"))
+            pred_by_layer[f"L{idx}"] = st
+    out["pred_layers"] = n_pred_layers
+    out["pred_count"] = pred_count
+    out["pred_hits"] = pred_hits
+    out["pred_hit_rate"] = (pred_hits / pred_count) if pred_count else None
+    if pred_by_layer:
+        out["pred_by_layer"] = pred_by_layer
+    return out
 
 
 __all__ = [

@@ -408,6 +408,14 @@ class ModelSettings:
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool = False
     moe_expert_offload_resident_fraction: float = 0.25  # 0 < fraction <= 1
+    # LES-style lookahead expert prefetch for the offload path above: predicts
+    # the next layer's experts from the router gate and keeps them resident
+    # while the current layer computes, hiding the SSD read behind compute.
+    # Off by default; only meaningful when moe_expert_offload_enabled.
+    moe_expert_lookahead_prefetch_enabled: bool = False
+    moe_expert_lookahead_prefetch_depth: int = 8   # == num_experts_per_tok
+    moe_expert_lookahead_prefetch_read: int = -1   # -1 = predict all `depth`
+    moe_expert_lookahead_prefetch_span: int = 8    # 1..16 layers ahead
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
