@@ -1,33 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Batched MoE offload install/evict path (A/B switch add-on).
-
-A minimal, drop-in counterpart to the per-expert ``_install`` loop in
-``moe_expert_offload.ExpertCache._ensure_ids``. This module keeps the
-*upstream* ``moe_expert_offload.py`` byte-for-byte untouched and instead
-installs an alternate ``_ensure_ids`` onto ``ExpertCache`` instances when
-the batched path is enabled. The upstream install path remains the default
-and is restored simply by not enabling the switch (or toggling ``cache.batch``
-back to ``False``).
-
-Why batch: a miss flood installs every miss with one ``_reserve`` + one
-``_write`` per expert. The batch path collects all of a call's misses and
-flushes them with a single atomic ``_reserve_many``/``_write_many`` pass,
-which (a) reserves every goal slot in one consistent snapshot so no slot is
-ever double-booked, and (b) reaches the steady-state eviction decision over
-the whole batch instead of one greedy step at a time.
-
-Correctness contract (identical to the upstream path):
-* A miss never evicts an expert needed by the same call (``protected``).
-* ``self.map`` stays an ``mx.int32`` MX array read by ``mx.take`` in
-  ``_forward_overlap``/``_forward_expert_major``.
-* ``slot_expert`` stays an ``np.int64`` array; the ``== -1`` sentinel and
-  ``.pop(slot_of, ...)`` (never ``del``) conventions are preserved.
-* Container types are preserved on every state mutation.
-
-The pre-fix naive batched reservation (one ``_reserve`` per slot in a loop)
-double-booked slots within a single call; do NOT reintroduce it. Keep the
-single-snapshot atomic simulation below.
-"""
+"""Batched install/evict add-on for the MoE expert offload path. """
 
 from __future__ import annotations
 
@@ -43,8 +15,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["batch", "apply_batch_install", "batch_ensure_ids"]
 
-# Keep the whole upstream install/IO surface behind one module reference so
-# this add-on stays a thin patch (no duplicated helpers).
+# Upstream install/IO surface, reused so this add-on stays a thin patch.
 _io_pool = _m._io_pool
 _io_batch = _m._io_batch
 _drain = _m._drain
@@ -52,17 +23,7 @@ _gpu_keepalive = _m._gpu_keepalive
 
 
 def _reserve_many(cache, experts, protected=frozenset()) -> list:
-    """Claim one slot per expert atomically; no slot is ever double-booked.
-
-    The naive loop calling :meth:`_reserve` ``n`` times is broken: after
-    step ``k`` evicts the lowest-score slot and marks it ``slot_expert=-1``,
-    the next step's ``np.argmin`` re-selects that same slot (its score was
-    not updated to inf), so two or more experts in the batch share a slot.
-    We instead snapshot the current free/occupied sets, simulate all
-    evictions in one pass, then apply the state changes atomically.
-
-    Returns ``[(expert_id, slot), ...]`` in the order of ``experts``.
-    """
+    """Reserve one slot per expert atomically in a single simulation pass."""
     free_set = set(cache.free)
     current_slot_expert = dict(
         zip(range(len(cache.slot_expert)), cache.slot_expert.tolist())
@@ -89,15 +50,13 @@ def _reserve_many(cache, experts, protected=frozenset()) -> list:
         if free_stack:
             slot = free_stack.pop()
         else:
-            best_slot = None
-            best_score = None
+            best_slot, best_score = None, None
             for s, exp_id in current_slot_expert.items():
                 if exp_id == -1 or s in batch_slots:
                     continue
                 sc = current_score[s]
                 if best_score is None or sc < best_score:
-                    best_score = sc
-                    best_slot = s
+                    best_score, best_slot = sc, s
             slot = best_slot
             evicted_exp = current_slot_expert[slot]
             if evicted_exp != -1:
@@ -127,7 +86,7 @@ def _reserve_many(cache, experts, protected=frozenset()) -> list:
 
 
 def _store(cache):
-    """Resolve the staging/checkpoint store ops for ``cache`` (may be None)."""
+    """Resolve staging/checkpoint store ops for ``cache`` (may be None)."""
     return (
         (cache._staging.to_mx, cache._staging.read)
         if cache._staging
@@ -136,24 +95,15 @@ def _store(cache):
 
 
 def _write_many(cache, pairs, protected=frozenset()) -> None:
-    """Install many experts in one call, with correct slot bookkeeping.
-
-    ``pairs`` is ``[(expert_id, payload), ...]``. Calls ``_reserve_many``
-    which simulates all evictions atomically so no slot is double-booked
-    and protected experts are never evicted. Raises on partial write.
-    """
+    """Install many experts atomically; raises on partial write."""
     if not pairs:
         return
-    expert_ids = [e for e, _ in pairs]
-    assignments = _reserve_many(cache, expert_ids, protected)
+    assignments = _reserve_many(cache, [e for e, _ in pairs], protected)
     slot_of = dict(assignments)
     written: list = []
     convert, _read = _store(cache)
-    # P1: batch the whole convert+install in one pass. Building every tensor
-    # first and flushing them with a single ``mx.eval`` avoids forcing an MX
-    # graph sync per field (the per-miss install loop syncs on every
-    # ``.resident[...] =`` assignment). All tensor targets are recorded, then
-    # one eval realises them all; assignment stays a plain object store.
+    # P1: build all tensors first, then flush with one mx.eval to avoid a
+    # per-field MX graph sync.
     to_realise: list = []
     try:
         for e, payload in pairs:
@@ -174,22 +124,14 @@ def _write_many(cache, pairs, protected=frozenset()) -> None:
 
 
 def batch_ensure_ids(cache, ids, on_slow_read=None, pending=None) -> bool:
-    """Batched replacement for ``ExpertCache._ensure_ids``.
-
-    Structurally identical to the upstream method except that all of a
-    call's misses are installed with one ``_write_many`` flush instead of
-    one ``_install`` per expert. The read-ahead/prefetch overlap work is
-    unchanged — only the slot install step is batched, which is the single
-    variable we want to A/B against the upstream path.
-    """
+    """Batched replacement for ``ExpertCache._ensure_ids``. Only the miss
+    install step is batched; read-ahead/prefetch overlap is unchanged."""
     cache._bind_staging()
     pending = dict(pending or {})
     needed = list(dict.fromkeys(int(e) for e in ids))
     if len(needed) > cache.capacity:
         _drain(pending)
-        raise ValueError(
-            "Expert cache capacity is smaller than the call's routes"
-        )
+        raise ValueError("Expert cache capacity is smaller than the call's routes")
     np.add.at(cache.score, np.asarray(ids, dtype=np.int64), 1.0)
     cache._calls += 1
     if cache._calls % _m._SCORE_DECAY_EVERY == 0:
@@ -247,7 +189,7 @@ def batch_ensure_ids(cache, ids, on_slow_read=None, pending=None) -> bool:
                         (name, field, plan, f.result())
                         for name, field, plan, f in group
                     ],
-                )
+                ),
             )
             del pending[e], group
         if pending_pairs:
@@ -259,8 +201,7 @@ def batch_ensure_ids(cache, ids, on_slow_read=None, pending=None) -> bool:
                         e,
                         p
                         or [
-                            (n, fld, pl, read(pl))
-                            for n, fld, pl in cache._plans(e)
+                            (n, fld, pl, read(pl)) for n, fld, pl in cache._plans(e)
                         ],
                     )
                     for e, p in pending_pairs
@@ -274,39 +215,20 @@ def batch_ensure_ids(cache, ids, on_slow_read=None, pending=None) -> bool:
 
 def batch(cache) -> bool:
     """True when ``cache`` is running the batched install path."""
-    return getattr(cache, "batch", False)
+    return bool(getattr(cache, "batch", False))
 
 
 def apply_batch_install(cache, enabled: bool) -> None:
-    """Toggle the batched install path on/off for one ``ExpertCache``.
-
-    * ``enabled=True``: bind ``batch_ensure_ids`` as ``cache._ensure_ids``
-      and set ``cache.batch=True``.
-    * ``enabled=False``: restore the original (upstream) ``_ensure_ids`` and
-      set ``cache.batch=False``.
-
-    The pristine upstream method is captured on first call so it can always
-    be restored — toggling off never loses the original install path.
-    """
-    import os as _os
-
-    def _probe(msg: str) -> None:
-        try:
-            with open("/tmp/batch_probe_state.txt", "a") as _f:
-                _f.write(msg + "\n")
-        except Exception:
-            pass
-
+    """Toggle the batched install path on/off for one ``ExpertCache``."""
+    # Capture the pristine upstream method once so it can always be restored.
     if not hasattr(cache, "_batch_original_ensure_ids"):
         cache._batch_original_ensure_ids = type(cache)._ensure_ids
     if enabled:
         cache._ensure_ids = batch_ensure_ids.__get__(cache, type(cache))
         cache.batch = True
-        _probe(f"ON  bound={batch_ensure_ids.__qualname__} cache.batch=True")
         logger.info("moe_expert_batch: batched install enabled for %s", cache)
     else:
         original = cache._batch_original_ensure_ids
         cache._ensure_ids = original.__get__(cache, type(cache))
         cache.batch = False
-        _probe(f"OFF bound={getattr(original, '__qualname__', original)} cache.batch=False")
         logger.info("moe_expert_batch: upstream install restored for %s", cache)
