@@ -21,6 +21,7 @@ from .model_profiles import (
     UNIVERSAL_FIELDS_SET,
     filter_profile_fields,
     filter_universal_fields,
+    normalize_turboquant_kv_bits,
     slugify_profile_api_name,
     validate_profile_name,
     utcnow,
@@ -36,7 +37,10 @@ SETTINGS_VERSION = 1
 MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 
 # These families keep the MTP head resident while backbone experts stream.
-MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next")
+# qwen4_exp (Qwen3.8-Flash-Next) drafts from its embedded native head, whose
+# experts the generic SwitchGLU adapter leaves resident (see
+# apply_moe_expert_offload's mtp_resident).
+MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next", "qwen4_exp")
 
 
 def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -> None:
@@ -200,7 +204,8 @@ class ModelSettings:
         chat_template_kwargs: Extra chat template keyword arguments.
         forced_ct_kwargs: Keys in chat_template_kwargs that cannot be overridden.
         ttl_seconds: Auto-unload after idle seconds (None = no TTL).
-        model_type_override: "llm", "vlm", "embedding", "reranker", or None (auto-detect).
+        model_type_override: "llm", "vlm", "embedding", "reranker", "decision",
+            or None (auto-detect).
         model_alias: API-visible alternative to the directory name.
         index_cache_freq: IndexCache: every Nth layer keeps indexer (DeepSeek DSA
             only; GLM-5.2 uses its native checkpoint schedule).
@@ -247,6 +252,9 @@ class ModelSettings:
             tensor operations -- M5-series and newer. On anything older the
             kernels do not load and the setting is refused. Decode is
             unaffected. Changes numerics: activations are quantized to INT8.
+            Also covers the routed-expert gate/up of Qwen3.8-Flash-Next
+            (affine Q4 / GS64 experts); the MTP draft layer and the down
+            projection stay on the A16 path.
             Mutually exclusive with qwen35_ane_prefill_enabled.
         qwen35_oq_a8_min_tokens: Shortest sequence routed to the kernels.
         moe_expert_offload_enabled: Stream MoE expert weights from the
@@ -321,7 +329,7 @@ class ModelSettings:
     )
     ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
     model_type_override: Optional[str] = (
-        None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
+        None  # "llm", "vlm", "embedding", "reranker", "decision", or None (auto)
     )
     model_alias: Optional[str] = (
         None  # API-visible name (alternative to directory name)
@@ -384,7 +392,7 @@ class ModelSettings:
     qwen35_ane_prefill_cpu_threads: int = 8
     qwen35_ane_prefill_cpu_shared_resource: bool = True
 
-    # oQ mixed-bit QxA8 prefill kernels for Qwen3.5/3.6/3.8.
+    # oQ mixed-bit QxA8 prefill kernels for Qwen3.5/3.6/3.8 and Qwen3.8 Flash-Next.
     #
     # Off by default because it is an accuracy decision, not just a speed one:
     # activations are quantized to INT8 per row, which the W4/W5A16 path does
@@ -402,6 +410,27 @@ class ModelSettings:
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool = False
     moe_expert_offload_resident_fraction: float = 0.25  # 0 < fraction <= 1
+    # LES-style lookahead expert prefetch for the offload path above: predicts
+    # the next layer's experts from the router gate and keeps them resident
+    # while the current layer computes, hiding the SSD read behind compute.
+        # Batch expert install for the offload path above: reserve all miss slots
+    # and write them in ONE _write_many call instead of one _install per miss.
+    # Off by default (= upstream per-expert install); only meaningful (and only
+    # honored) when moe_expert_offload_enabled.
+    moe_expert_offload_batch_enabled: bool = False
+    # Chunk size for the batched expert install above: a batch of ``N`` misses
+    # is split into install chunks of at most this many experts, so the atomic
+    # slot reservation + tensor conversion + mx.eval work happens in bounded
+    # bursts instead of one unbounded burst. This bounds host-memory bandwidth
+    # pressure (large single reserve/convert bursts would spike bandwidth and
+    # fight the IO reader pool) and avoids one giant reserve/convert pass on
+    # large MoE models. Values are clamped to [2, io_window] at use time,
+    # where io_window is the upstream reader pool's in-flight read window
+    # (moe_expert_offload._io_batch(), 4 x 12 workers = 48 by default): the
+    # install chunk can never exceed the reads the IO pipeline may have in
+    # flight anyway, so it cannot starve the prefetch window. Ignored when
+    # moe_expert_offload_batch_enabled is off.
+    moe_expert_offload_batch_chunk: int = 4
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
@@ -477,10 +506,24 @@ class ModelSettings:
     is_hidden: bool = False  # Hidden from /v1/models (still shown, badged, in admin)
     is_favorite: bool = False  # Listed first in /v1/models and admin lists
 
+    # External engine serving this model instead of oMLX's MLX engines
+    # (omlx/engine/splash.py). None runs the model in-process.
+    external_engine: Optional[str] = None
+
     # Security: opt-in per model. When True, mlx-lm/mlx-vlm/mlx-embeddings/reranker
     # loaders are allowed to execute custom Python from the model repository
     # (modeling_*.py, tokenization_*.py). Off by default — see issue #926.
     trust_remote_code: bool = False
+
+    # Embedding models with an audio tower (EmbeddingGemma 2): load it so
+    # /v1/embeddings accepts items[].audio. Off by default because the tower is
+    # resident even for text-only requests (EmbeddingGemma 2: 0.88 -> 1.46 GB).
+    embedding_audio_enabled: bool = False
+    # Longest audio item, in seconds, an embedding model reads before cutting
+    # the waveform. None keeps the processor default (Gemma 4 audio: 30 s).
+    # The model's context still bounds it: EmbeddingGemma 2 fits about 327 s
+    # (8192 tokens at 40 ms each); longer inputs get the token-limit error.
+    embedding_audio_max_seconds: Optional[float] = None
 
     # Metadata
     display_name: Optional[str] = None
@@ -488,6 +531,8 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
+        # Profiles retain raw JSON types; engine signatures use repr().
+        self.turboquant_kv_bits = normalize_turboquant_kv_bits(self.turboquant_kv_bits)
         if self.qwen35_oq_a8_enabled and self.qwen35_oq_a8_min_tokens < 1:
             raise ValueError("qwen35_oq_a8_min_tokens must be at least 1")
         # Both accelerate the same Qwen3.5 prefill projections by wrapping
@@ -552,6 +597,8 @@ class ModelSettings:
         result = {}
         for f in fields(self):
             value = getattr(self, f.name)
+            if f.name == "turboquant_kv_bits":
+                value = normalize_turboquant_kv_bits(value)
             if value is not None:
                 result[f.name] = value
         return result
@@ -800,7 +847,11 @@ class ModelSettingsManager:
                 for model_id, settings in self._settings.items()
             },
         }
+        self._write_settings_file(data)
+        logger.debug(f"Saved settings for {len(self._settings)} models")
 
+    def _write_settings_file(self, data: dict) -> None:
+        """Replace the settings file with ``data`` atomically."""
         # Write to temp file first, then rename for atomicity. The pid in
         # the temp name keeps concurrent processes from sharing a temp path
         # and renaming each other's partial writes into place.
@@ -814,7 +865,6 @@ class ModelSettingsManager:
                 os.fsync(f.fileno())
 
             temp_file.replace(self.settings_file)
-            logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
             logger.error(f"Failed to save settings file: {e}")
@@ -837,6 +887,47 @@ class ModelSettingsManager:
                 return ModelSettings.from_dict(settings.to_dict())
 
             return ModelSettings()
+
+    def has_settings(self, model_id: str) -> bool:
+        """Return True when settings for the model are saved."""
+        with self._lock:
+            return model_id in self._settings
+
+    def add_initial_settings(self, initial: dict[str, dict[str, Any]]) -> list[str]:
+        """Save settings for models that have none yet.
+
+        Only the new records are added to the file. Records already on disk
+        keep their content, including fields or records this build cannot
+        load. Nothing is written when the file cannot be read. Returns the
+        IDs of the models that were added.
+        """
+        with self._lock:
+            pending = [mid for mid in initial if mid not in self._settings]
+            if not pending:
+                return []
+            data: Any = {"version": SETTINGS_VERSION, "models": {}}
+            if self.settings_file.exists():
+                try:
+                    data = json.loads(self.settings_file.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as e:
+                    logger.warning(f"Initial model settings not saved: {e}")
+                    return []
+            models = data.setdefault("models", {}) if isinstance(data, dict) else None
+            if not isinstance(models, dict):
+                logger.warning("Initial model settings not saved: invalid file")
+                return []
+            added = {
+                mid: ModelSettings.from_dict(initial[mid])
+                for mid in pending
+                if mid not in models
+            }
+            if not added:
+                return []
+            for mid, settings in added.items():
+                models[mid] = settings.to_dict()
+            self._write_settings_file(data)
+            self._settings.update(added)
+            return list(added)
 
     def get_settings_for_request(
         self,
@@ -978,6 +1069,11 @@ class ModelSettingsManager:
                 used_api_names: set[str] = set()
                 for name, profile in profiles.items():
                     settings = profile.get("settings")
+                    # Normalize in memory only; the next save writes floats.
+                    if settings and "turboquant_kv_bits" in settings:
+                        settings["turboquant_kv_bits"] = normalize_turboquant_kv_bits(
+                            settings["turboquant_kv_bits"]
+                        )
                     if settings and "ttl_seconds" in settings:
                         del settings["ttl_seconds"]
                         changed = True
@@ -1636,7 +1732,7 @@ class ModelSettingsManager:
 
     def list_templates(self) -> list[dict]:
         # Shipped JSON seeds were retired in favor of the client-side preset
-        # bundle (`omlx/admin/static/omlx_preset.json`); every entry on this
+        # bundle (`omlx_web/static/omlx_preset.json`); every entry on this
         # surface is user-created. Callers that distinguish presets from
         # user templates do so via the preset bundle, not an `is_builtin`
         # flag on this response.
