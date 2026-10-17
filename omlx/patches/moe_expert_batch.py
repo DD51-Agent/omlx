@@ -70,14 +70,13 @@ def _reserve_many(cache, experts, protected=frozenset()) -> list:
         batch_slots.add(slot)
         new_slots[e] = slot
 
-    cache.slot_expert = np.array(
-        [current_slot_expert[s] for s in range(len(cache.slot_expert))],
-        dtype=np.int64,
-    )
-    cache.slot_of = dict(current_slot_of)
-    cache.map = mx.array(
-        [current_map[e] for e in range(cache.n_experts)], dtype=mx.int32
-    )
+    for e2 in list(current_slot_of.keys()):
+        if e2 not in new_slots:
+            del current_slot_of[e2]
+    for e, slot in new_slots.items():
+        cache.map[e] = slot
+        cache.slot_expert[slot] = e
+        cache.slot_of[e] = slot
     cache.score = current_score
     cache.free = [
         s for s in range(len(cache.slot_expert)) if cache.slot_expert[s] == -1
@@ -94,39 +93,71 @@ def _store(cache):
     )
 
 
-def _write_many(cache, pairs, protected=frozenset()) -> None:
-    """Install many experts atomically; raises on partial write."""
+def _write_many(
+    cache, pairs, protected=frozenset(), chunk: int | None = None
+) -> None:
+    """Install many experts in batches of at most ``chunk``; sequential.
+
+    The install is split into batches of at most ``chunk`` experts (``chunk``
+    None/<=0 -> one batch). Each batch is *fully independent*: slot
+    reservation runs on the current cache state, then convert + write
+    complete the batch before the next one starts. Later batches therefore
+    observe earlier batches' evictions — a 7-miss + chunk=2 schedule is
+    2,2,2,1 (4 batches). When ``chunk`` is None the whole install is a
+    single batch.
+
+    No mx.eval is issued at batch boundaries: ``_reserve_many`` commits
+    slot assignments as scalar index writes (same shape as upstream's
+    per-expert install loop), so Metal's single-stream ordering makes them
+    visible to the downstream ``mx.take`` in qmm without an explicit sync
+    point — matching upstream's measured-zero-eval install behaviour.
+    Weight payloads written into ``cache.resident`` stay in the Metal
+    lazy queue and are realised once by the prefill chunk's own eval,
+    exactly like upstream.
+
+    Raises on partial write; already-installed batches stay in place."""
     if not pairs:
         return
-    assignments = _reserve_many(cache, [e for e, _ in pairs], protected)
-    slot_of = dict(assignments)
-    written: list = []
     convert, _read = _store(cache)
-    # P1: build all tensors first, then flush with one mx.eval to avoid a
-    # per-field MX graph sync.
-    to_realise: list = []
+    step = chunk if chunk and chunk > 0 else len(pairs)
     try:
-        for e, payload in pairs:
-            slot = slot_of[e]
-            for name, field, plan, raw in payload:
-                t = convert(plan, raw)
-                cache.resident[name][field][slot] = t
-                to_realise.append(t)
-            written.append(e)
-        if to_realise:
-            mx.eval(*to_realise)
+        for start in range(0, len(pairs), step):
+            batch = pairs[start : start + step]
+            assignments = _reserve_many(
+                cache, [e for e, _ in batch], protected
+            )
+            slot_of = dict(assignments)
+            for e, payload in batch:
+                slot = slot_of[e]
+                for name, field, plan, raw in payload:
+                    t = convert(plan, raw)
+                    cache.resident[name][field][slot] = t
         cache.warm = len(cache.slot_of) == cache.n_experts
         cache.fetched_bytes += len(pairs) * cache.expert_bytes
     except BaseException:
-        for e in written:
-            cache.slot_of.pop(e, None)
         raise
 
 
 def batch_ensure_ids(cache, ids, on_slow_read=None, pending=None) -> bool:
     """Batched replacement for ``ExpertCache._ensure_ids``. Only the miss
-    install step is batched; read-ahead/prefetch overlap is unchanged."""
+    install step is batched; read-ahead/prefetch overlap is unchanged.
+
+    The install is split into sequential batches of at most
+    ``moe_expert_offload_batch_chunk`` experts (clamped to [2, io_window],
+    default 4): each batch reserves slots on the current cache state, then
+    converts, writes, then the next batch starts — no explicit flush
+    between batches; downstream prefill's per-chunk eval materialises
+    the pending weight writes, exactly like upstream. The chunk is read
+    once per call from ``cache.model_settings`` so it can change between
+    model reloads without a server restart."""
     cache._bind_staging()
+    settings = getattr(cache, "model_settings", None)
+    raw_chunk = getattr(settings, "moe_expert_offload_batch_chunk", 4)
+    # Clamp to [2, io_window]: below 2 the prefetch window makes chunking
+    # pointless, and above the in-flight read window the chunk would only
+    # hold payloads whose reads already finished, i.e. it would grow memory
+    # bandwidth pressure for no overlap benefit.
+    chunk = min(max(int(raw_chunk or 4), 2), max(_io_batch(), 2))
     pending = dict(pending or {})
     needed = list(dict.fromkeys(int(e) for e in ids))
     if len(needed) > cache.capacity:
@@ -194,6 +225,10 @@ def batch_ensure_ids(cache, ids, on_slow_read=None, pending=None) -> bool:
             del pending[e], group
         if pending_pairs:
             _convert, read = _store(cache)
+            logger.info(
+                "moe_expert_batch: installing %d expert(s) this batch",
+                len(pending_pairs),
+            )
             _write_many(
                 cache,
                 [
@@ -207,6 +242,7 @@ def batch_ensure_ids(cache, ids, on_slow_read=None, pending=None) -> bool:
                     for e, p in pending_pairs
                 ],
                 protected=protected,
+                chunk=chunk,
             )
     finally:
         _drain(pending)
