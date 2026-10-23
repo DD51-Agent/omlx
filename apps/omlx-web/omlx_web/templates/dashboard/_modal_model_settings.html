@@ -866,6 +866,28 @@
                                         <span class="text-xs text-neutral-500">{{ t('modal.model_settings.moe_expert_offload_resident_range') }}</span>
                                     </div>
                                     <p x-show="moeExpertOffloadResidentInvalid() && modelSettings.moe_expert_offload_resident_touched" x-cloak class="mt-1.5 text-xs text-red-600">{{ t('modal.model_settings.moe_expert_offload_resident_range_error') }}</p>
+                                    <div class="mt-3 flex items-start justify-between gap-3">
+                                        <div class="min-w-0">
+                                            <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.moe_expert_offload_batch') }}</span>
+                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.moe_expert_offload_batch_hint') }}</p>
+                                        </div>
+                                        <button type="button"
+                                                @click="modelSettings.moe_expert_offload_batch_enabled = !modelSettings.moe_expert_offload_batch_enabled"
+                                                :class="[modelSettings.moe_expert_offload_batch_enabled ? 'bg-black' : 'bg-neutral-200']"
+                                                class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            <span :class="modelSettings.moe_expert_offload_batch_enabled ? 'translate-x-5' : 'translate-x-0'" class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
+                                    </div>
+                                    <div class="mt-3 flex items-start justify-between gap-3">
+                                        <div class="min-w-0">
+                                            <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.moe_expert_offload_shadow') }}</span>
+                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.moe_expert_offload_shadow_hint') }}</p>
+                                        </div>
+                                        <input type="number" min="0" max="64" step="1" inputmode="numeric"
+                                               aria-label="{{ t('modal.model_settings.moe_expert_offload_shadow') }}"
+                                               x-model.number="modelSettings.moe_expert_offload_shadow_slots"
+                                               class="w-24 px-4 py-2.5 border rounded-lg text-sm focus:ring-2 focus:border-transparent transition-all bg-white border-neutral-200 focus:ring-neutral-900">
+                                    </div>
                                 </div>
                             </div>
                         </template>

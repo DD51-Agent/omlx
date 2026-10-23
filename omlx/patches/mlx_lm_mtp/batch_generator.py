@@ -31,6 +31,7 @@ from omlx.prefill_progress import get_prefill_tracker
 from . import cache_rollback as _rollback_mod
 from . import context_copy as _context_copy
 from . import prompt_priming as _prompt_priming
+from .. import moe_expert_mtp_prefetch as _moe_mtp_pf
 
 logger = logging.getLogger(__name__)
 
@@ -3172,6 +3173,10 @@ def _chain_next_drafts(
     import mlx.core as mx
 
     model = gen_batch.model
+    # MTP draft-window prefetch: the head forwards below leave the target
+    # expert pools IO-idle; stage the next verify's reads here so they
+    # overlap the draft compute (no-op unless the feature was installed).
+    _moe_mtp_pf.begin_draft_window(model)
     if _dspark_host(model) is not None:
         return _dspark_next_drafts(
             gen_batch,
@@ -4275,6 +4280,7 @@ def _run_verify_cycle_chain(
 
     import mlx.core as mx
 
+    _moe_mtp_pf.mark_verify(gen_batch.model)
     missing = "chain cycle entered without next_main / drafts"
     sync = _cluster_mtp(gen_batch.model)
     follower = sync is not None and not sync.is_leader
@@ -4335,6 +4341,7 @@ def _run_verify_cycle_chain(
         )
     logits, hidden, gdn_states = verify_result[:3]
     captured = verify_result[3] if len(verify_result) > 3 else None
+    _moe_mtp_pf.end_verify(gen_batch.model)
     if drafter is not None and captured is None:
         raise _MtpStepFallback("block drafter verify returned no layer captures")
     state.stats.backbone_ms += verify_ms
@@ -4782,6 +4789,7 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
 
     import mlx.core as mx
 
+    _moe_mtp_pf.mark_verify(gen_batch.model)
     if state.next_main is None or state.draft_tok is None:
         raise _MtpStepFallback("verify cycle entered without next_main / draft")
 
@@ -4818,6 +4826,7 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
     bonus_logits = logits[:, 1, :]
     mx.eval(logits)
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
+    _moe_mtp_pf.end_verify(gen_batch.model)
 
     t0 = time.perf_counter()
     verify_snap = None
