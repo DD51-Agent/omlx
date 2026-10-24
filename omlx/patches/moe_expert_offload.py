@@ -340,8 +340,14 @@ def _gpu_keepalive() -> _GpuKeepalive:
     return ka
 
 
-def _drain(pending: dict) -> None:
-    """Cancel or finish unused reads, so no read outlives the shard descriptors."""
+def _drain(pending: dict | None) -> None:
+    """Cancel or finish unused reads, so no read outlives the shard descriptors.
+
+    ``pending`` may be ``None`` on the default call path (no staged reads);
+    an empty drain is a no-op.
+    """
+    if not pending:
+        return
     futures = [f for group in pending.values() for _, _, _, f in group]
     for future in futures:
         future.cancel()

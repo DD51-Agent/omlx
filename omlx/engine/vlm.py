@@ -2294,6 +2294,7 @@ class VLMBatchedEngine(BaseEngine):
                     mtp_resident=bool(
                         getattr(self._model_settings, "mtp_enabled", False)
                     ),
+                    model_settings=self._model_settings,
                 ),
                 self._vlm_model,
                 self._model_name,
