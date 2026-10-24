@@ -40,7 +40,13 @@ MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 # qwen4_exp (Qwen3.8-Flash-Next) drafts from its embedded native head, whose
 # experts the generic SwitchGLU adapter leaves resident (see
 # apply_moe_expert_offload's mtp_resident).
-MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next", "qwen4_exp")
+MOE_OFFLOAD_MTP_MODEL_TYPES = (
+    "deepseek_v41",
+    "glm5_next",
+    "qwen4_exp",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+)
 
 
 def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -> None:
@@ -450,6 +456,30 @@ class ModelSettings:
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool = False
     moe_expert_offload_resident_fraction: float = 0.25  # 0 < fraction <= 1
+
+    # Opt-in batched expert install (atomic reserve + one _write_many burst);
+    # off by default (= upstream per-expert install), only honored when moe_expert_offload_enabled.
+    moe_expert_offload_batch_enabled: bool = False
+
+    # Shadow slot pool: extra per-layer expert slots beyond the resident
+    # fraction.  New/cold experts overflow into it and eviction prefers it,
+    # so the primary core (the configured resident fraction) stops churning
+    # and steady-state SSD misses drop.  0 = off (byte-identical legacy);
+    # only honored when moe_expert_offload_enabled.  Memory cost is the full
+    # shadow pool: shadow_slots * layers * expert_bytes.
+    moe_expert_offload_shadow_slots: int = 8
+
+    # MTP draft-window expert prefetch: during a Lightning MTP draft phase the
+    # target expert pools are IO-idle; the next verify's predicted expert set
+    # is read ahead there and consumed by the verify's ensure (pending
+    # plumbing). Couples the MTP line with the batch-expert line — MTP
+    # supplies the window, the loader supplies the install. Off by default,
+    # only honored when moe_expert_offload_enabled + mtp_enabled.
+    moe_expert_mtp_prefetch: bool = False
+    # Routing-history window (verify cycles) feeding the per-layer predictor.
+    moe_expert_mtp_prefetch_window: int = 4
+    # Max distinct experts staged per layer per draft window.
+    moe_expert_mtp_prefetch_limit: int = 16
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False

@@ -48,6 +48,8 @@
         'qwen35_ane_prefill_cpu_threads',
         'qwen35_ane_prefill_cpu_shared_resource',
         'moe_expert_offload_enabled',
+        'moe_expert_offload_batch_enabled',
+        'moe_expert_offload_shadow_slots',
         'moe_expert_offload_resident_fraction',
         'qwen35_oq_a8_enabled',
         'qwen35_oq_a8_min_tokens',
@@ -296,6 +298,8 @@
                 qwen35_ane_prefill_cpu_threads: 8,
                 qwen35_ane_prefill_cpu_shared_resource: true,
                 moe_expert_offload_enabled: false,
+                moe_expert_offload_batch_enabled: false,
+                moe_expert_offload_shadow_slots: 8,
                 moe_expert_offload_resident_fraction: 0.25,
                 qwen35_oq_a8_enabled: false,
                 qwen35_oq_a8_min_tokens: 128,
@@ -2176,6 +2180,8 @@
                     turboquant_kv_bits: isDiffusion || model?.is_paroquant
                         ? 4 : (s.turboquant_kv_bits || 4),
                     moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
+                    moe_expert_offload_batch_enabled: !!s.moe_expert_offload_batch_enabled,
+                    moe_expert_offload_shadow_slots: s.moe_expert_offload_shadow_slots ?? 8,
                     moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
                     moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
                     moe_expert_offload_resident_touched: false,
@@ -3200,6 +3206,9 @@
                         : ms.turboquant_kv_enabled ? (parseFloat(ms.turboquant_kv_bits) || 4)
                         : 4,
                     moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!ms.moe_expert_offload_enabled,
+                    moe_expert_offload_batch_enabled: !!ms.moe_expert_offload_batch_enabled,
+                    moe_expert_offload_shadow_slots: Number.isFinite(Number(ms.moe_expert_offload_shadow_slots))
+                        ? Number(ms.moe_expert_offload_shadow_slots) : 8,
                     moe_expert_offload_resident_fraction: ms.moe_expert_offload_resident_fraction ?? 0.25,
                     qwen35_oq_a8_enabled: !!ms.qwen35_oq_a8_enabled,
                     qwen35_oq_a8_min_tokens: Number(ms.qwen35_oq_a8_min_tokens) || 128,

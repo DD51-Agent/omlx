@@ -410,6 +410,14 @@ class ModelSettingsRequest(BaseModel):
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool | None = None
     moe_expert_offload_resident_fraction: float | None = None
+    # Opt-in batched expert install for the offload path above
+    moe_expert_offload_batch_enabled: bool | None = None
+    # Shadow pool: extra cache slots kept hot behind the resident set
+    moe_expert_offload_shadow_slots: int | None = None
+    # MTP draft-window expert prefetch (experimental)
+    moe_expert_mtp_prefetch: bool | None = None
+    moe_expert_mtp_prefetch_window: int | None = None
+    moe_expert_mtp_prefetch_limit: int | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -3129,6 +3137,26 @@ async def update_model_settings(
             0.25
             if request.moe_expert_offload_resident_fraction is None
             else request.moe_expert_offload_resident_fraction
+        )
+    if "moe_expert_offload_batch_enabled" in sent:
+        current_settings.moe_expert_offload_batch_enabled = (
+            request.moe_expert_offload_batch_enabled or False
+        )
+    if "moe_expert_offload_shadow_slots" in sent:
+        current_settings.moe_expert_offload_shadow_slots = (
+            request.moe_expert_offload_shadow_slots
+        )
+    if "moe_expert_mtp_prefetch" in sent:
+        current_settings.moe_expert_mtp_prefetch = (
+            request.moe_expert_mtp_prefetch or False
+        )
+    if "moe_expert_mtp_prefetch_window" in sent:
+        current_settings.moe_expert_mtp_prefetch_window = (
+            request.moe_expert_mtp_prefetch_window
+        )
+    if "moe_expert_mtp_prefetch_limit" in sent:
+        current_settings.moe_expert_mtp_prefetch_limit = (
+            request.moe_expert_mtp_prefetch_limit
         )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
