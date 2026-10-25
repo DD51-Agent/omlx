@@ -370,23 +370,10 @@ class ExpertCache:
     moe_offload_cache = True  # walked by materialize_offload_state / stats
 
     def __init__(
-        self,
-        glu: SwitchGLU,
-        capacity: int,
-        disk: _GLUStoreView,
-        floor: int = 1,
-        shadow: int = 0,
+        self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView, floor: int = 1
     ):
         self.n_experts = glu.gate_proj["weight"].shape[0]
-        # Two-tier slot space: slots [0, pcap) = primary (hot core),
-        # [pcap, pcap+shadow) = shadow (churn buffer).  The shadow tier holds
-        # the working set beyond the configured resident fraction: new/cold
-        # experts overflow into it and eviction prefers it, so the primary
-        # core stops churning (fewer SSD misses) without shared slots.
-        # shadow=0 keeps the legacy single-tier behavior untouched.
-        self.pcap = min(capacity, self.n_experts)
-        self.shadow = max(0, int(shadow))
-        self.full_capacity = min(self.pcap + self.shadow, self.n_experts)
+        self.full_capacity = min(capacity, self.n_experts)
         # The capacity release_slots() shrinks to: the routing top-k floor.
         self.floor = min(max(floor, 1), self.full_capacity)
         self.projs = _PROJS
@@ -430,22 +417,9 @@ class ExpertCache:
         }
         self.slot_of: dict[int, int] = {}  # Expert id -> slot
         self.slot_expert = np.full(capacity, -1, dtype=np.int64)
+        self.free = list(range(capacity))
         self.map = mx.full((self.n_experts,), -1, dtype=mx.int32)
         self.warm = False
-        self._split_free()
-
-    def _split_free(self) -> None:
-        """Partition the empty slots into tiered free lists.
-
-        ``free`` holds primary-tier empties, ``free_s`` shadow-tier empties.
-        Allocation prefers the primary tier (hot core fills first); eviction
-        frees into the matching list.  With ``shadow=0`` ``free_s`` stays
-        empty and the behavior matches the legacy single list.
-        """
-        b = min(self.pcap, self.capacity)
-        empt = np.where(self.slot_expert < 0)[0]
-        self.free = [int(i) for i in empt if i < b]
-        self.free_s = [int(i) for i in empt if i >= b]
 
     def release_slots(self) -> int:
         """Shrink to ``floor`` empty slots; return the slot bytes given up."""
@@ -481,8 +455,6 @@ class ExpertCache:
 
     def _reserve(self, protected=frozenset()) -> int:
         """Claim a slot, evicting the lowest-count expert outside ``protected``."""
-        if self.shadow:
-            return self._reserve_tiered(protected)
         if self.free:
             return self.free.pop()
         scores = self.score[self.slot_expert]
@@ -494,47 +466,6 @@ class ExpertCache:
         old_e = int(self.slot_expert[slot])
         del self.slot_of[old_e]
         self.slot_expert[slot] = -1
-        self.map[old_e] = -1
-        return slot
-
-    def _reserve_tiered(self, protected=frozenset()) -> int:
-        """Two-tier claim: primary free, then shadow free, then evict.
-
-        Eviction prefers shadow-tier residents (the churn buffer) so the
-        primary core keeps its working set; only when the shadow tier holds
-        nothing evictable falls back to the whole-pool argmin.  Freed slots
-        are appended to their tier's free list (legacy never re-appends —
-        that dirty list was the shared-slot corruption this design removes).
-        """
-        if self.free:
-            return self.free.pop()
-        if self.free_s:
-            return self.free_s.pop()
-        slots = self.slot_expert
-        scores = self.score[slots].copy()
-        scores[slots < 0] = np.inf
-        for e in protected:
-            s = self.slot_of.get(e)
-            if s is not None:
-                scores[s] = np.inf
-        b = min(self.pcap, self.capacity)
-        if self.capacity > b:  # a shadow tier exists and is fully occupied
-            seg = np.where((np.arange(self.capacity) >= b))[0]
-            seg = seg[self.slot_expert[seg] >= 0]
-            if seg.size:
-                slot = int(seg[int(np.argmin(scores[seg]))])
-                old_e = int(slots[slot])
-                del self.slot_of[old_e]
-                slots[slot] = -1
-                self.map[old_e] = -1
-                # No free-list append: the caller consumes the returned slot
-                # immediately (legacy _reserve contract).  The next call
-                # re-argmins; the batch path re-appends via _evict_bulk.
-                return slot
-        slot = int(np.argmin(scores))
-        old_e = int(slots[slot])
-        del self.slot_of[old_e]
-        slots[slot] = -1
         self.map[old_e] = -1
         return slot
 
@@ -644,16 +575,7 @@ class ExpertCache:
 
         try:
             prefetch(window)
-            # OMLX_MOE_OVERLAP=0: no deadline/slow branch/keepalive — the first-miss
-            # wait becomes blocking, so the install sequence is wall-clock free
-            # (deterministic slot ordering across cold runs).
-            # Self-contained gate: ExpertCache has no _overlap attribute of its
-            # own (OffloadSwitchGLU sets it on itself), so fall back to the env
-            # var — identical semantics, no AttributeError on miss paths.
-            _overlap_on = getattr(
-                self, "_overlap", os.environ.get("OMLX_MOE_OVERLAP", "1") != "0"
-            )
-            deadline = time.perf_counter() + (_OVERLAP_GRACE_S if _overlap_on else float("inf"))
+            deadline = time.perf_counter() + _OVERLAP_GRACE_S
             for done, e in enumerate(misses):
                 self.misses += 1
                 # Count the current payload in the window until its writes finish.
@@ -755,21 +677,14 @@ class OffloadSwitchGLU(nn.Module):
     """SwitchGLU whose experts live in an :class:`ExpertCache`."""
 
     def __init__(
-        self,
-        glu: SwitchGLU,
-        capacity: int,
-        disk: _GLUStoreView,
-        floor: int = 1,
-        shadow: int = 0,
+        self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView, floor: int = 1
     ):
         super().__init__()
-        self.cache = ExpertCache(glu, capacity, disk, floor, shadow)
+        self.cache = ExpertCache(glu, capacity, disk, floor)
         self.activation = glu.activation
         # Fetch/compute overlap in decode: the GPU stays busy while slow
-        # reads of missing experts are pending.  OMLX_MOE_OVERLAP=0 forces
-        # the synchronous ensure + full-gather path (deterministic; used to
-        # audit the wall-clock hit/miss split under MTP).
-        self._overlap = os.environ.get("OMLX_MOE_OVERLAP", "1") != "0"
+        # reads of missing experts are pending.
+        self._overlap = True
 
     def _glu(self, x: mx.array, slots: mx.array) -> mx.array:
         c = self.cache
@@ -1238,11 +1153,16 @@ def apply_moe_expert_offload(
             )
         )
         total_bytes += layer_bytes
-        resident_bytes += layer_bytes * capacity // n_experts
         shadow_slots = int(
             getattr(model_settings, "moe_expert_offload_shadow_slots", 0)
         ) if model_settings is not None else 0
-        new = OffloadSwitchGLU(glu, capacity, view, minimum, shadow=shadow_slots)
+        cap_eff = min(capacity + shadow_slots, n_experts) if shadow_slots else capacity
+        resident_bytes += layer_bytes * cap_eff // n_experts
+        new = OffloadSwitchGLU(glu, cap_eff, view, minimum)
+        if shadow_slots:
+            from . import moe_expert_shadow
+
+            moe_expert_shadow.apply_shadow_upgrade(new.cache, capacity, shadow_slots)
         # Keep children the model reads beside the projections (mlx-lm's Muse
         # Spark holds its post-expert norm on the experts module).
         for name, child in glu.children().items():
@@ -1329,7 +1249,6 @@ def estimate_offload_admission_bytes(
     resident_fraction: float = 0.25,
     *,
     mtp_resident: bool = False,
-    model_settings: object | None = None,
 ) -> int:
     """Admission-time size estimate with offload active.
 
