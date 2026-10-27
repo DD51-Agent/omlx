@@ -464,6 +464,15 @@ class ModelSettings:
     moe_expert_offload_enabled: bool = False
     moe_expert_offload_resident_fraction: float = 0.25  # 0 < fraction <= 1
 
+    # Opt-in batched expert install (atomic reserve + one _write_many burst);
+    # off by default (= upstream per-expert install), only honored when
+    # moe_expert_offload_enabled.
+    moe_expert_offload_batch_enabled: bool = False
+    # Shadow-tier slot space (churn buffer) added to the resident pool.  Memory
+    # cost is the full shadow pool: shadow_slots * layers * expert_bytes.
+    # Only honored when moe_expert_offload_enabled.
+    moe_expert_offload_shadow_slots: int = 0
+
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
     specprefill_draft_model: Optional[str] = (

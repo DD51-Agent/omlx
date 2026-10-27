@@ -1048,6 +1048,7 @@ def apply_moe_expert_offload(
     resident_fraction: float = 0.25,
     *,
     mtp_resident: bool = False,
+    model_settings=None,
 ) -> int:
     """Replace covered SwitchGLU instances with offloaded ones.
 
@@ -1061,6 +1062,18 @@ def apply_moe_expert_offload(
     ``mtp.*`` is skipped by the generic traversal below). Other families
     reject the combination at validation.
     """
+    # Opt-in feature knobs (fork additions; default off = pristine upstream
+    # behavior).  The heavy logic lives in the standalone modules below so
+    # this file stays as close to upstream as possible.
+    shadow_slots = 0
+    batch_enabled = False
+    if model_settings is not None:
+        shadow_slots = int(
+            getattr(model_settings, "moe_expert_offload_shadow_slots", 0) or 0
+        )
+        batch_enabled = bool(
+            getattr(model_settings, "moe_expert_offload_batch_enabled", False)
+        )
     model_dir = _resolve_model_dir(model_path)
     if model_dir is None:
         return 0
@@ -1123,8 +1136,20 @@ def apply_moe_expert_offload(
             )
         )
         total_bytes += layer_bytes
-        resident_bytes += layer_bytes * capacity // n_experts
-        new = OffloadSwitchGLU(glu, capacity, view, minimum)
+        cap_eff = (
+            min(capacity + shadow_slots, n_experts) if shadow_slots else capacity
+        )
+        resident_bytes += layer_bytes * cap_eff // n_experts
+        new = OffloadSwitchGLU(glu, cap_eff, view, minimum)
+        if shadow_slots:
+            from . import moe_expert_shadow
+
+            moe_expert_shadow.apply_shadow_upgrade(new.cache, capacity, shadow_slots)
+        if batch_enabled:
+            from . import moe_expert_batch
+
+            new.cache.model_settings = model_settings
+            moe_expert_batch.apply_batch_install(new.cache)
         # Keep children the model reads beside the projections (mlx-lm's Muse
         # Spark holds its post-expert norm on the experts module).
         for name, child in glu.children().items():
